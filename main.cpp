@@ -82,6 +82,8 @@ bool isGlassy = true;
 UINT_PTR idleTimerId = 0;
 DWORD lastColorClickTime = 0;
 int lastColorClickId = -1;
+HHOOK hMouseHook = NULL;
+DWORD lastRClickTime = 0;
 
 Color darkPal[6] = {
     Color(255, 0, 0, 0), Color(255, 100, 0, 0), Color(255, 0, 100, 0), 
@@ -170,6 +172,7 @@ void RefreshOverlay();
 void RefreshToolbar();
 void SaveScreenshot();
 int GetEncoderClsid(const WCHAR* format, CLSID* pClsid);
+LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam);
 
 // --- Entry Point ---
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
@@ -214,6 +217,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     ShowWindow(hWndToolbar, nCmdShow);
     
     lastInteractionTime = GetTickCount();
+    hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
     idleTimerId = SetTimer(hWndToolbar, 1, 1000, NULL); // Check idle every second
 
     RefreshToolbar();
@@ -225,6 +229,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         DispatchMessage(&msg);
     }
 
+    if (hMouseHook) UnhookWindowsHookEx(hMouseHook);
     ShutdownGDIPlus();
     return (int)msg.wParam;
 }
@@ -786,3 +791,21 @@ void CreateOverlay(HINSTANCE hInstance) {
 void InitGDIPlus() { GdiplusStartupInput gsi; GdiplusStartup(&gdiplusToken, &gsi, NULL); }
 void ShutdownGDIPlus() { GdiplusShutdown(gdiplusToken); }
 void DrawRoundedRect(Graphics& g, const Rect& rect, int radius, const Brush* brush, const Pen* pen) { GraphicsPath path; int d = radius * 2; path.AddArc(rect.X, rect.Y, d, d, 180, 90); path.AddArc(rect.X + rect.Width - d, rect.Y, d, d, 270, 90); path.AddArc(rect.X + rect.Width - d, rect.Y + rect.Height - d, d, d, 0, 90); path.AddArc(rect.X, rect.Y + rect.Height - d, d, d, 90, 90); path.CloseFigure(); if (brush) g.FillPath(brush, &path); if (pen) g.DrawPath(pen, &path); }
+
+LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_RBUTTONDOWN) {
+            DWORD now = GetTickCount();
+            if (now - lastRClickTime < GetDoubleClickTime()) {
+                if (!isDrawingMode) {
+                    if (currentTool == ToolType::POINTER) currentTool = ToolType::FREEHAND;
+                    SetDrawingMode(true);
+
+                    return 1; // Consume the second click of the double-right-click
+                }
+            }
+            lastRClickTime = now;
+        }
+    }
+    return CallNextHookEx(hMouseHook, nCode, wParam, lParam);
+}
