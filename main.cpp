@@ -1,5 +1,8 @@
 #include <windows.h>
 #include <dwmapi.h>
+#include <commdlg.h>
+#include <fstream>
+#include <string>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <string>
@@ -55,6 +58,13 @@ bool isDrawingMode = true;
 bool isCompactMode = false;
 std::wstring toastMessage;
 DWORD toastExpiryTime = 0;
+
+// --- Forward Declarations ---
+void SetupUI();
+void RefreshToolbar();
+void RefreshOverlay();
+void SaveScreenshot();
+void SetDrawingMode(bool active);
 Color currentColor = Color(255, 255, 255, 255);
 float currentThickness = 3.0f;
 ToolType currentTool = ToolType::FREEHAND;
@@ -68,7 +78,61 @@ PointF lastMousePos;
 DWORD lastInteractionTime = 0;
 BYTE currentOpacity = 255;
 bool isLightTheme = false;
+bool isGlassy = true;
 UINT_PTR idleTimerId = 0;
+DWORD lastColorClickTime = 0;
+int lastColorClickId = -1;
+
+Color darkPal[6] = {
+    Color(255, 0, 0, 0), Color(255, 100, 0, 0), Color(255, 0, 100, 0), 
+    Color(255, 0, 0, 100), Color(255, 80, 80, 80), Color(255, 139, 69, 19)
+};
+Color lightPal[6] = {
+    Color(255, 255, 255, 255), Color(255, 255, 50, 50), Color(255, 50, 255, 50), 
+    Color(255, 50, 50, 255), Color(255, 200, 200, 200), Color(255, 255, 165, 0)
+};
+
+void SaveSettings() {
+    std::ofstream out("settings.bin", std::ios::binary);
+    if (out) {
+        out.write((char*)&isLightTheme, sizeof(isLightTheme));
+        out.write((char*)&isGlassy, sizeof(isGlassy));
+        out.write((char*)&isCompactMode, sizeof(isCompactMode));
+        out.write((char*)&currentThickness, sizeof(currentThickness));
+        out.write((char*)darkPal, sizeof(darkPal));
+        out.write((char*)lightPal, sizeof(lightPal));
+    }
+}
+
+void LoadSettings() {
+    std::ifstream in("settings.bin", std::ios::binary);
+    if (in) {
+        in.read((char*)&isLightTheme, sizeof(isLightTheme));
+        in.read((char*)&isGlassy, sizeof(isGlassy));
+        in.read((char*)&isCompactMode, sizeof(isCompactMode));
+        in.read((char*)&currentThickness, sizeof(currentThickness));
+        in.read((char*)darkPal, sizeof(darkPal));
+        in.read((char*)lightPal, sizeof(lightPal));
+    }
+}
+
+void PickColor(int index) {
+    CHOOSECOLOR cc = {0};
+    static COLORREF cust[16] = {0};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hWndToolbar;
+    Color& c = isLightTheme ? lightPal[index] : darkPal[index];
+    cc.rgbResult = RGB(c.GetR(), c.GetG(), c.GetB());
+    cc.lpCustColors = cust;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (ChooseColor(&cc)) {
+        c = Color(255, GetRValue(cc.rgbResult), GetGValue(cc.rgbResult), GetBValue(cc.rgbResult));
+        currentColor = c;
+        SaveSettings();
+        SetupUI();
+        RefreshToolbar();
+    }
+}
 
 // --- Helpers ---
 float GetDistance(PointF p, PointF a, PointF b) {
@@ -113,6 +177,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     SetProcessDPIAware();
     
     InitGDIPlus();
+    LoadSettings();
     hInst = hInstance;
 
     WNDCLASSEXW wcex = {0};
@@ -185,20 +250,30 @@ void SetupUI() {
             }});
         }
 
-        // Color Theme Toggle
-        buttons.push_back({350, ButtonType::ACTION, isLightTheme ? L"BRT" : L"DRK", Rect(5, 160, 40, 20), Color::Transparent, 0, []() { 
-            isLightTheme = !isLightTheme; SetupUI(); RefreshToolbar(); 
-        }});
-
-        Color darkPal[] = {Color(255, 0, 0, 0), Color(255, 100, 0, 0), Color(255, 0, 100, 0), Color(255, 0, 0, 100)};
-        Color lightPal[] = {Color(255, 255, 255, 255), Color(255, 255, 100, 100), Color(255, 100, 255, 100), Color(255, 100, 100, 255)};
-        Color* pal = isLightTheme ? lightPal : darkPal;
-
-        for (int i = 0; i < 4; i++) {
-            buttons.push_back({300+i, ButtonType::COLOR, L"", Rect((cw-24)/2, 190 + i * 28, 24, 24), pal[i], 0, [c = pal[i]]() { currentColor = c; }});
+        // Pen Tips (2, 3, 4)
+        float compactSizes[] = {2, 3, 4};
+        for (int i = 0; i < 3; i++) {
+            buttons.push_back({250+i, ButtonType::THICKNESS, L"", Rect((cw-20)/2, 160 + i * 25, 20, 20), Color::Transparent, compactSizes[i], [sz = compactSizes[i]]() { 
+                currentThickness = sz; RefreshToolbar(); 
+            }});
         }
-        buttons.push_back({500, ButtonType::ACTION, L"CAP", Rect(5, 310, 40, 20), Color::Transparent, 0, []() { SaveScreenshot(); }});
-        buttons.push_back({501, ButtonType::ACTION, L"CLR", Rect(5, 335, 40, 20), Color::Transparent, 0, []() { strokes.clear(); RefreshOverlay(); }});
+
+        // Colors (6)
+        Color* pal = isLightTheme ? lightPal : darkPal;
+        for (int i = 0; i < 6; i++) {
+            buttons.push_back({300+i, ButtonType::COLOR, L"", Rect((cw-26)/2, 235 + i * 30, 26, 26), pal[i], 0, [i]() { 
+                DWORD now = GetTickCount();
+                if (lastColorClickId == 300+i && (now - lastColorClickTime) < 500) {
+                    PickColor(i);
+                } else {
+                    currentColor = isLightTheme ? lightPal[i] : darkPal[i];
+                }
+                lastColorClickTime = now;
+                lastColorClickId = 300+i;
+            }});
+        }
+
+        SetWindowPos(hWndToolbar, NULL, 0, 0, 50, 430, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     } else {
         buttons.push_back({100, ButtonType::SYSTEM, L"_", Rect(TOOLBAR_WIDTH - 60, 5, 25, 25), Color::Transparent, 0, []() { ShowWindow(hWndToolbar, SW_MINIMIZE); }});
         buttons.push_back({102, ButtonType::SYSTEM, L"=", Rect(TOOLBAR_WIDTH - 85, 5, 25, 25), Color::Transparent, 0, []() { 
@@ -240,8 +315,19 @@ void SetupUI() {
             }});
         }
 
-        buttons.push_back({500, ButtonType::ACTION, L"Capturar", Rect(15, 380, TOOLBAR_WIDTH - 30, 40), Color::Transparent, 0, []() { SaveScreenshot(); }});
-        buttons.push_back({501, ButtonType::ACTION, L"Limpiar", Rect(15, 435, TOOLBAR_WIDTH - 30, 40), Color::Transparent, 0, []() { strokes.clear(); RefreshOverlay(); }});
+        // Bottom Utilities in Big Mode
+        int by = 420;
+        buttons.push_back({500, ButtonType::ACTION, L"CAPTURE", Rect(15, by, 70, 25), Color::Transparent, 0, []() { SaveScreenshot(); }});
+        buttons.push_back({501, ButtonType::ACTION, L"CLEAR ALL", Rect(95, by, 70, 25), Color::Transparent, 0, []() { strokes.clear(); RefreshOverlay(); }});
+        
+        buttons.push_back({350, ButtonType::ACTION, isLightTheme ? L"LIGHT" : L"DARK", Rect(15, by + 30, 70, 25), Color::Transparent, 0, []() { 
+            isLightTheme = !isLightTheme; SaveSettings(); SetupUI(); RefreshToolbar(); 
+        }});
+        buttons.push_back({351, ButtonType::ACTION, isGlassy ? L"GLASS ON" : L"GLASS OFF", Rect(95, by + 30, 70, 25), Color::Transparent, 0, []() { 
+            isGlassy = !isGlassy; RefreshToolbar(); 
+        }});
+
+        SetWindowPos(hWndToolbar, NULL, 0, 0, 180, 520, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -330,10 +416,9 @@ void RefreshOverlay() {
 
 void RefreshToolbar() {
     if (!hWndToolbar) return;
-    RECT rc; GetWindowRect(hWndToolbar, &rc);
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    if (w <= 0 || h <= 0) return;
-
+    int w = isCompactMode ? 50 : 180;
+    int h = isCompactMode ? 430 : 520;
+    
     HDC hdcScreen = GetDC(NULL);
     HDC hMemDC = CreateCompatibleDC(hdcScreen);
     HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, w, h);
@@ -347,15 +432,36 @@ void RefreshToolbar() {
         // Transparent background
         g.Clear(Color(0, 0, 0, 0));
         
-        // Draw Toolbar Frame
-        Rect toolbarRect(0, 0, w, h);
-        SolidBrush bgBrush(Color(240, 245, 245, 250)); // Light premium grey
-        Pen borderPen(Color(100, 180, 180, 190), 1);
-        DrawRoundedRect(g, toolbarRect, 15, &bgBrush, &borderPen);
+        // Draw Toolbar Frame - Glassy Style
+        GraphicsPath path;
+        int r = 15;
+        float bw = 1.0f; // Border width offset
+        RectF glassRect(bw, bw, (float)w - bw*2, (float)h - bw*2);
+        
+        float r2 = (float)r * 2.0f;
+        path.AddArc(glassRect.X, glassRect.Y, r2, r2, 180.0f, 90.0f);
+        path.AddArc(glassRect.X + glassRect.Width - r2, glassRect.Y, r2, r2, 270.0f, 90.0f);
+        path.AddArc(glassRect.X + glassRect.Width - r2, glassRect.Y + glassRect.Height - r2, r2, r2, 0.0f, 90.0f);
+        path.AddArc(glassRect.X, glassRect.Y + glassRect.Height - r2, r2, r2, 90.0f, 90.0f);
+        path.CloseFigure();
 
-        FontFamily ff(L"Arial");
-        Font f(&ff, 12, FontStyleBold, UnitPixel);
+        // Dark or Light Glass Fill
+        BYTE alpha = isGlassy ? 160 : 255;
+        Color bgCol = isLightTheme ? Color(alpha, 240, 240, 245) : Color(alpha, 25, 30, 35);
+        SolidBrush bgBrush(bgCol); 
+        g.FillPath(&bgBrush, &path);
+
+        // Glass Border (Rim Light)
+        Color rimCol = isLightTheme ? Color(100, 0, 0, 0) : Color(80, 255, 255, 255);
+        Pen borderPen(rimCol, 1);
+        g.DrawPath(&borderPen, &path);
+
+        FontFamily ff(L"Segoe UI");
+        Font f(&ff, 11, FontStyleBold, UnitPixel);
         StringFormat sf; sf.SetAlignment(StringAlignmentCenter); sf.SetLineAlignment(StringAlignmentCenter);
+
+        Color textCol = isLightTheme ? Color(255, 30, 35, 40) : Color(255, 255, 255, 255);
+        SolidBrush textBrush(textCol);
 
         for (auto& btn : buttons) {
             if (btn.type == ButtonType::COLOR) {
@@ -363,43 +469,44 @@ void RefreshToolbar() {
                 Pen p(Color(255, 255, 255, 255), 2);
                 DrawRoundedRect(g, btn.rect, 6, &b, (currentColor.GetValue() == btn.color.GetValue()) ? &p : NULL);
             } else if (btn.type == ButtonType::THICKNESS) {
-                SolidBrush b(Color(255, 60, 80, 80));
+                SolidBrush b(isLightTheme ? Color(255, 80, 85, 90) : Color(255, 200, 220, 230)); 
                 int d = (int)btn.value;
                 g.FillEllipse(&b, btn.rect.X + (btn.rect.Width-d)/2, btn.rect.Y + (btn.rect.Height-d)/2, d, d);
-                if (currentThickness == btn.value) { Pen p(Color(255, 100, 200, 255), 2); g.DrawEllipse(&p, btn.rect.X + (btn.rect.Width-d)/2 - 2, btn.rect.Y + (btn.rect.Height-d)/2 - 2, d+4, d+4); }
-            } else if (btn.type == ButtonType::TOOL) {
-                bool isActive = (currentTool == g_toolTypes[btn.id - 400]);
-                SolidBrush b(btn.isHovered ? Color(255, 220, 230, 240) : Color(0, 0, 0, 0));
-                Pen p(Color(255, 60, 80, 80), 2);
-                if (isActive && isDrawingMode) {
-                    b.SetColor(Color(255, 0, 120, 215));
-                    p.SetColor(Color(255, 255, 255, 255));
+                if (currentThickness == btn.value) { 
+                    Pen p(Color(255, 0, 150, 255), 2); 
+                    g.DrawEllipse(&p, btn.rect.X + (btn.rect.Width-d)/2 - 2, btn.rect.Y + (btn.rect.Height-d)/2 - 2, d+4, d+4); 
                 }
-                DrawRoundedRect(g, btn.rect, 8, &b, NULL);
+            } else if (btn.type == ButtonType::TOOL) {
+                bool isActive = false;
+                for(int i=0; i<9; i++) if(g_toolTypes[i] == currentTool && btn.id == 400+i) isActive = true;
                 
+                if (btn.isHovered || (isActive && isDrawingMode)) {
+                    SolidBrush b(isActive && isDrawingMode ? Color(180, 0, 120, 215) : Color(60, 255, 255, 255));
+                    DrawRoundedRect(g, btn.rect, 8, &b, NULL);
+                }
+                
+                Pen p(textCol, 2); // Opaque icons matching theme
                 int cx = btn.rect.X + btn.rect.Width/2, cy = btn.rect.Y + btn.rect.Height/2, s = 8;
                 if (btn.label == L"~") { g.DrawBezier(&p, Point(cx-s, cy), Point(cx-s/2, cy-s), Point(cx+s/2, cy+s), Point(cx+s, cy)); }
                 else if (btn.label == L"O") { g.DrawEllipse(&p, cx-s, cy-s, s*2, s*2); }
                 else if (btn.label == L"[]") { g.DrawRectangle(&p, cx-s, cy-s, s*2, s*2); }
                 else { 
-                    SolidBrush t(isActive && isDrawingMode ? Color(255, 255, 255, 255) : Color(255, 60, 80, 80)); 
-                    RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); 
-                    g.DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t); 
+                    g.DrawString(btn.label.c_str(), -1, &f, RectF((float)btn.rect.X, (float)btn.rect.Y, (float)btn.rect.Width, (float)btn.rect.Height), &sf, &textBrush); 
                 }
             } else if (btn.type == ButtonType::ACTION || btn.type == ButtonType::SYSTEM) {
-                SolidBrush b(btn.isHovered ? Color(255, 210, 210, 220) : Color(255, 230, 230, 230)); 
-                if (btn.label == L"X" && btn.isHovered) b.SetColor(Color(255, 230, 50, 50));
-                Pen p(Color(100, 100, 100, 100), 1);
-                DrawRoundedRect(g, btn.rect, btn.type == ButtonType::SYSTEM ? 5 : 10, &b, &p); 
-                SolidBrush t(btn.label == L"X" && btn.isHovered ? Color(255, 255, 255, 255) : Color(255, 30, 30, 30));
-                RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); 
-                g.DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t);
+                if (btn.isHovered) {
+                    SolidBrush b(btn.label == L"X" ? Color(200, 230, 50, 50) : (isLightTheme ? Color(100, 0, 0, 0) : Color(80, 255, 255, 255)));
+                    DrawRoundedRect(g, btn.rect, btn.type == ButtonType::SYSTEM ? 5 : 10, &b, NULL);
+                }
+                g.DrawString(btn.label.c_str(), -1, &f, RectF((float)btn.rect.X, (float)btn.rect.Y, (float)btn.rect.Width, (float)btn.rect.Height), &sf, &textBrush);
             }
         }
     }
 
     POINT ptSrc = { 0, 0 };
-    POINT ptDest = { rc.left, rc.top };
+    POINT ptDest = { 0, 0 };
+    RECT rcW; GetWindowRect(hWndToolbar, &rcW);
+    ptDest.x = rcW.left; ptDest.y = rcW.top;
     SIZE size = { w, h };
     BLENDFUNCTION blend = { AC_SRC_OVER, 0, currentOpacity, AC_SRC_ALPHA };
 
