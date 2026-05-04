@@ -310,7 +310,17 @@ LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             }
             EndPaint(hWnd, &ps);
         } break;
-        case WM_NCHITTEST: { LRESULT h = DefWindowProc(hWnd, message, wParam, lParam); if (h == HTCLIENT) return HTCAPTION; return h; }
+        case WM_NCHITTEST: { 
+            POINT pt = { LOWORD(lParam), HIWORD(lParam) };
+            ScreenToClient(hWnd, &pt);
+            for (const auto& btn : buttons) {
+                if (pt.x >= btn.rect.X && pt.x <= btn.rect.X + btn.rect.Width && 
+                    pt.y >= btn.rect.Y && pt.y <= btn.rect.Y + btn.rect.Height) {
+                    return HTCLIENT; // Area is a button, handle normally
+                }
+            }
+            return HTCAPTION; // Rest of window is draggable
+        }
         case WM_MOUSEMOVE: {
             int x = LOWORD(lParam), y = HIWORD(lParam); bool c = false;
             for (auto& btn : buttons) { bool h = (x >= btn.rect.X && x <= btn.rect.X + btn.rect.Width && y >= btn.rect.Y && y <= btn.rect.Y + btn.rect.Height); if (h != btn.isHovered) { btn.isHovered = h; c = true; } }
