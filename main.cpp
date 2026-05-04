@@ -99,15 +99,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     SetupUI();
 
+    // Create Overlay first so it can be the owner of the toolbar
+    CreateOverlay(hInstance);
+
     hWndToolbar = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         L"ScreenPenToolbarV2", L"ScreenPen", WS_POPUP, 0, 0, TOOLBAR_WIDTH, TOOLBAR_HEIGHT,
-        NULL, NULL, hInstance, NULL);
+        hWndOverlay, NULL, hInstance, NULL); // hWndOverlay is the owner
 
     SetLayeredWindowAttributes(hWndToolbar, 0, 255, LWA_ALPHA);
     PositionToolbar(hWndToolbar);
     ShowWindow(hWndToolbar, nCmdShow);
-
-    CreateOverlay(hInstance);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -170,12 +171,16 @@ void SetDrawingMode(bool active) {
     SetWindowLong(hWndOverlay, GWL_EXSTYLE, exStyle);
     
     // Maintain Z-order: Toolbar on top of Overlay, both Topmost
-    SetWindowPos(hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    // Note: Since hWndToolbar is owned by hWndOverlay, it will naturally stay on top,
+    // but we re-assert topmost status just in case.
+    SetWindowPos(hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     SetWindowPos(hWndToolbar, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
     if (active) {
         SetForegroundWindow(hWndOverlay);
         SetCursor(LoadCursor(NULL, IDC_CROSS));
+    } else {
+        SetForegroundWindow(hWndToolbar);
     }
 }
 
@@ -215,6 +220,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             }
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
+        case WM_KEYDOWN: {
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
+                if (!strokes.empty()) {
+                    strokes.pop_back();
+                    InvalidateRect(hWnd, NULL, TRUE);
+                }
+            } else if (wParam == VK_DELETE) {
+                strokes.clear();
+                InvalidateRect(hWnd, NULL, TRUE);
+            }
+        } break;
+        case WM_SYSKEYDOWN: {
+            // Check for Alt + F4 (SC_CLOSE is handled in WM_SYSCOMMAND usually, but we can catch it here)
+            if (wParam == VK_F4 && (lParam & (1 << 29))) { // Alt is bit 29
+                PostQuitMessage(0);
+            }
+        } break;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hWnd, &ps);
@@ -263,6 +285,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             }
         } break;
         case WM_RBUTTONDOWN: SetDrawingMode(false); break;
+        case WM_CLOSE: PostQuitMessage(0); break;
+        case WM_DESTROY: PostQuitMessage(0); break;
         default: return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
@@ -331,6 +355,18 @@ LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             int x = LOWORD(lParam), y = HIWORD(lParam);
             for (auto& btn : buttons) { if (x >= btn.rect.X && x <= btn.rect.X + btn.rect.Width && y >= btn.rect.Y && y <= btn.rect.Y + btn.rect.Height) { btn.onClick(); InvalidateRect(hWnd, NULL, FALSE); break; } }
         } break;
+        case WM_KEYDOWN: {
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
+                if (!strokes.empty()) {
+                    strokes.pop_back();
+                    InvalidateRect(hWndOverlay, NULL, TRUE);
+                }
+            } else if (wParam == VK_DELETE) {
+                strokes.clear();
+                InvalidateRect(hWndOverlay, NULL, TRUE);
+            }
+        } break;
+        case WM_CLOSE: PostQuitMessage(0); break;
         case WM_DESTROY: PostQuitMessage(0); break;
         default: return DefWindowProc(hWnd, message, wParam, lParam);
     }
