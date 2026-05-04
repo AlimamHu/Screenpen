@@ -21,7 +21,7 @@ const int CORNER_RADIUS = 15;
 
 // --- Enums ---
 enum class ButtonType { COLOR, THICKNESS, TOOL, ACTION, SYSTEM };
-enum class ToolType { FREEHAND, POLYGON, ARROW, CIRCLE, SELECTOR, ERASER, UNDO, POINTER };
+enum class ToolType { FREEHAND, POLYGON, ARROW, CIRCLE, RECTANGLE, SELECTOR, ERASER, UNDO, POINTER };
 
 // --- UI Structures ---
 struct Button {
@@ -53,11 +53,34 @@ bool isDrawingMode = false;
 Color currentColor = Color(255, 255, 255, 255);
 float currentThickness = 3.0f;
 ToolType currentTool = ToolType::FREEHAND;
-ToolType g_toolTypes[] = {ToolType::FREEHAND, ToolType::POLYGON, ToolType::ARROW, ToolType::CIRCLE, ToolType::SELECTOR, ToolType::ERASER, ToolType::UNDO, ToolType::POINTER};
+ToolType g_toolTypes[] = {ToolType::FREEHAND, ToolType::POLYGON, ToolType::ARROW, ToolType::CIRCLE, ToolType::RECTANGLE, ToolType::SELECTOR, ToolType::ERASER, ToolType::UNDO, ToolType::POINTER};
 
 std::vector<Stroke> strokes;
 Stroke currentStroke;
 bool isLButtonDown = false;
+int selectedStrokeIndex = -1;
+PointF lastMousePos;
+
+// --- Helpers ---
+float GetDistance(PointF p, PointF a, PointF b) {
+    float l2 = pow(b.X - a.X, 2) + pow(b.Y - a.Y, 2);
+    if (l2 == 0.0) return sqrt(pow(p.X - a.X, 2) + pow(p.Y - a.Y, 2));
+    float t = std::max(0.0f, std::min(1.0f, ((p.X - a.X) * (b.X - a.X) + (p.Y - a.Y) * (b.Y - a.Y)) / l2));
+    PointF proj = { a.X + t * (b.X - a.X), a.Y + t * (b.Y - a.Y) };
+    return sqrt(pow(p.X - proj.X, 2) + pow(p.Y - proj.Y, 2));
+}
+
+bool HitTest(PointF pt, const Stroke& s) {
+    float th = s.width + 10.0f;
+    if (s.tool == ToolType::FREEHAND || s.tool == ToolType::POLYGON || s.tool == ToolType::ARROW) {
+        for (size_t i = 0; i < s.points.size() - 1; i++) if (GetDistance(pt, s.points[i], s.points[i+1]) < th) return true;
+    } else if (s.tool == ToolType::CIRCLE || s.tool == ToolType::RECTANGLE) {
+        PointF p1 = s.points[0], p2 = s.points.back();
+        RectF r(std::min(p1.X, p2.X), std::min(p1.Y, p2.Y), std::abs(p2.X - p1.X), std::abs(p2.Y - p1.Y));
+        if (pt.X >= r.X - th && pt.X <= r.X + r.Width + th && pt.Y >= r.Y - th && pt.Y <= r.Y + r.Height + th) return true;
+    }
+    return false;
+}
 
 // --- Forward Declarations ---
 LRESULT CALLBACK ToolbarWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -140,8 +163,9 @@ void SetupUI() {
         buttons.push_back({300 + i, ButtonType::COLOR, L"", Rect(15 + (i % 4) * 40, 100 + (i / 4) * 40, 32, 32), palette[i], 0, [c = palette[i]]() { currentColor = c; }});
     }
 
-    std::wstring labels[] = {L"~", L"Z", L"->", L"O", L"Sel", L"E", L"U", L"Ptr"};
-    for (int i = 0; i < 8; i++) {
+    std::wstring labels[] = {L"~", L"Z", L"->", L"O", L"[]", L"Sel", L"E", L"U", L"Ptr"};
+    int toolCount = 9;
+    for (int i = 0; i < toolCount; i++) {
         buttons.push_back({400 + i, ButtonType::TOOL, labels[i], Rect(15 + (i % 4) * 40, 280 + (i / 4) * 40, 32, 32), Color::Transparent, 0, [t = g_toolTypes[i]]() { 
             currentTool = t;
             if (t == ToolType::UNDO) {
@@ -207,6 +231,10 @@ void DrawStroke(Graphics& g, const Stroke& stroke) {
         PointF start = stroke.points[0];
         PointF end = stroke.points.back();
         g.DrawEllipse(&p, RectF(std::min(start.X, end.X), std::min(start.Y, end.Y), std::abs(end.X - start.X), std::abs(end.Y - start.Y)));
+    } else if (stroke.tool == ToolType::RECTANGLE) {
+        PointF start = stroke.points[0];
+        PointF end = stroke.points.back();
+        g.DrawRectangle(&p, RectF(std::min(start.X, end.X), std::min(start.Y, end.Y), std::abs(end.X - start.X), std::abs(end.Y - start.Y)));
     }
 }
 
@@ -215,35 +243,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         case WM_ERASEBKGND: return 1;
         case WM_SETCURSOR: {
             if (isDrawingMode) {
-                SetCursor(LoadCursor(NULL, IDC_CROSS));
+                if (currentTool == ToolType::SELECTOR) {
+                    POINT pt; GetCursorPos(&pt); ScreenToClient(hWnd, &pt);
+                    bool overStroke = false;
+                    for (const auto& s : strokes) if (HitTest(PointF((REAL)pt.x, (REAL)pt.y), s)) { overStroke = true; break; }
+                    SetCursor(LoadCursor(NULL, overStroke ? IDC_SIZEALL : IDC_ARROW));
+                } else {
+                    SetCursor(LoadCursor(NULL, IDC_CROSS));
+                }
                 return TRUE;
             }
             return DefWindowProc(hWnd, message, wParam, lParam);
         }
-        case WM_KEYDOWN: {
-            if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
-                if (!strokes.empty()) {
-                    strokes.pop_back();
-                    InvalidateRect(hWnd, NULL, TRUE);
-                }
-            } else if (wParam == VK_DELETE) {
-                strokes.clear();
-                InvalidateRect(hWnd, NULL, TRUE);
-            }
-        } break;
-        case WM_SYSKEYDOWN: {
-            // Check for Alt + F4 (SC_CLOSE is handled in WM_SYSCOMMAND usually, but we can catch it here)
-            if (wParam == VK_F4 && (lParam & (1 << 29))) { // Alt is bit 29
-                PostQuitMessage(0);
-            }
-        } break;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hWnd, &ps);
             Graphics g(hdc);
             g.SetSmoothingMode(SmoothingModeAntiAlias);
             for (const auto& s : strokes) DrawStroke(g, s);
-            if (isLButtonDown) {
+            if (isLButtonDown && currentTool != ToolType::SELECTOR) {
                 currentStroke.color = currentColor;
                 currentStroke.width = currentThickness;
                 currentStroke.tool = currentTool;
@@ -253,33 +271,52 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         } break;
         case WM_LBUTTONDOWN: {
             if (!isDrawingMode) return DefWindowProc(hWnd, message, wParam, lParam);
+            PointF pt((REAL)LOWORD(lParam), (REAL)HIWORD(lParam));
+            if (currentTool == ToolType::SELECTOR) {
+                selectedStrokeIndex = -1;
+                for (int i = (int)strokes.size() - 1; i >= 0; i--) {
+                    if (HitTest(pt, strokes[i])) { selectedStrokeIndex = i; break; }
+                }
+                lastMousePos = pt;
+            } else {
+                currentStroke.tool = currentTool;
+                currentStroke.color = currentColor;
+                currentStroke.width = currentThickness;
+                currentStroke.points.clear();
+                currentStroke.points.push_back(pt);
+            }
             isLButtonDown = true;
-            currentStroke.tool = currentTool;
-            currentStroke.color = currentColor;
-            currentStroke.width = currentThickness;
-            currentStroke.points.clear();
-            currentStroke.points.push_back(PointF((REAL)LOWORD(lParam), (REAL)HIWORD(lParam)));
             SetCapture(hWnd);
         } break;
         case WM_MOUSEMOVE: {
+            PointF pt((REAL)LOWORD(lParam), (REAL)HIWORD(lParam));
             if (isLButtonDown) {
-                PointF pt((REAL)LOWORD(lParam), (REAL)HIWORD(lParam));
-                if (currentTool == ToolType::FREEHAND) {
-                    currentStroke.points.push_back(pt);
-                } else {
-                    if (currentStroke.points.size() < 2) currentStroke.points.push_back(pt);
-                    else currentStroke.points[1] = pt;
+                if (currentTool == ToolType::SELECTOR && selectedStrokeIndex != -1) {
+                    float dx = pt.X - lastMousePos.X, dy = pt.Y - lastMousePos.Y;
+                    for (auto& p : strokes[selectedStrokeIndex].points) { p.X += dx; p.Y += dy; }
+                    lastMousePos = pt;
+                } else if (currentTool != ToolType::SELECTOR) {
+                    if (currentTool == ToolType::FREEHAND) {
+                        currentStroke.points.push_back(pt);
+                    } else {
+                        if (currentStroke.points.size() < 2) currentStroke.points.push_back(pt);
+                        else currentStroke.points[1] = pt;
+                    }
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
+            } else if (currentTool == ToolType::SELECTOR) {
+                // Force cursor update
+                SendMessage(hWnd, WM_SETCURSOR, (WPARAM)hWnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
             }
         } break;
         case WM_LBUTTONUP: {
             if (isLButtonDown) {
                 isLButtonDown = false;
                 ReleaseCapture();
-                if (currentStroke.points.size() >= 2) {
+                if (currentTool != ToolType::SELECTOR && currentStroke.points.size() >= 2) {
                     strokes.push_back(currentStroke);
                 }
+                selectedStrokeIndex = -1;
                 currentStroke.points.clear();
                 InvalidateRect(hWnd, NULL, TRUE);
             }
@@ -287,6 +324,16 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         case WM_RBUTTONDOWN: SetDrawingMode(false); break;
         case WM_CLOSE: PostQuitMessage(0); break;
         case WM_DESTROY: PostQuitMessage(0); break;
+        case WM_KEYDOWN: {
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
+                if (!strokes.empty()) { strokes.pop_back(); InvalidateRect(hWnd, NULL, TRUE); }
+            } else if (wParam == VK_DELETE) {
+                strokes.clear(); InvalidateRect(hWnd, NULL, TRUE);
+            }
+        } break;
+        case WM_SYSKEYDOWN: {
+            if (wParam == VK_F4 && (lParam & (1 << 29))) PostQuitMessage(0);
+        } break;
         default: return DefWindowProc(hWnd, message, wParam, lParam);
     }
     return 0;
@@ -294,44 +341,55 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 
 LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hWnd, &ps);
-            Graphics g(hdc);
-            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            RECT rc; GetClientRect(hWnd, &rc);
+            Bitmap bmp(rc.right, rc.bottom);
+            Graphics* g = Graphics::FromImage(&bmp);
+            g->SetSmoothingMode(SmoothingModeAntiAlias);
+            
             SolidBrush bgBrush(Color(255, 180, 180, 190));
-            DrawRoundedRect(g, Rect(0, 0, TOOLBAR_WIDTH, TOOLBAR_HEIGHT), CORNER_RADIUS, &bgBrush, NULL);
+            DrawRoundedRect(*g, Rect(0, 0, TOOLBAR_WIDTH, TOOLBAR_HEIGHT), CORNER_RADIUS, &bgBrush, NULL);
+            
             FontFamily ff(L"Segoe UI");
             Font f(&ff, 14, FontStyleRegular, UnitPixel);
             StringFormat sf; sf.SetAlignment(StringAlignmentCenter); sf.SetLineAlignment(StringAlignmentCenter);
+            
             for (auto& btn : buttons) {
                 if (btn.type == ButtonType::COLOR) {
                     SolidBrush b(btn.color);
                     Pen p(Color(255, 255, 255, 255), 2);
-                    DrawRoundedRect(g, btn.rect, 8, &b, (currentColor.GetValue() == btn.color.GetValue()) ? &p : NULL);
+                    DrawRoundedRect(*g, btn.rect, 8, &b, (currentColor.GetValue() == btn.color.GetValue()) ? &p : NULL);
                 } else if (btn.type == ButtonType::THICKNESS) {
                     SolidBrush b(Color(255, 60, 80, 80));
                     int d = (int)btn.value;
-                    g.FillEllipse(&b, btn.rect.X + (20-d)/2, btn.rect.Y + (20-d)/2, d, d);
-                    if (currentThickness == btn.value) { Pen p(Color(255, 255, 255, 255), 2); g.DrawEllipse(&p, btn.rect.X + (20-d)/2 - 2, btn.rect.Y + (20-d)/2 - 2, d+4, d+4); }
+                    g->FillEllipse(&b, btn.rect.X + (20-d)/2, btn.rect.Y + (20-d)/2, d, d);
+                    if (currentThickness == btn.value) { Pen p(Color(255, 255, 255, 255), 2); g->DrawEllipse(&p, btn.rect.X + (20-d)/2 - 2, btn.rect.Y + (20-d)/2 - 2, d+4, d+4); }
                 } else if (btn.type == ButtonType::TOOL) {
                     bool isActive = (currentTool == g_toolTypes[btn.id - 400]);
                     Pen p(Color(255, 60, 80, 80), 2);
                     if (isActive && isDrawingMode) p.SetColor(Color(255, 0, 120, 215));
                     int cx = btn.rect.X + 16, cy = btn.rect.Y + 16, s = 8;
-                    if (btn.label == L"~") { g.DrawBezier(&p, Point(cx-s, cy), Point(cx-s/2, cy-s), Point(cx+s/2, cy+s), Point(cx+s, cy)); }
-                    else if (btn.label == L"Z") { Point pts[] = { Point(cx-s, cy+s), Point(cx, cy-s), Point(cx+s, cy+s) }; g.DrawLines(&p, pts, 3); }
-                    else if (btn.label == L"->") { g.DrawLine(&p, cx-s, cy+s, cx+s, cy-s); g.DrawLine(&p, cx+s, cy-s, cx+s-5, cy-s); g.DrawLine(&p, cx+s, cy-s, cx+s, cy-s+5); }
-                    else if (btn.label == L"O") { g.DrawEllipse(&p, cx-s, cy-s, s*2, s*2); }
-                    else { SolidBrush t(Color(255, 60, 80, 80)); RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, 32, 32); g.DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t); }
+                    if (btn.label == L"~") { g->DrawBezier(&p, Point(cx-s, cy), Point(cx-s/2, cy-s), Point(cx+s/2, cy+s), Point(cx+s, cy)); }
+                    else if (btn.label == L"Z") { Point pts[] = { Point(cx-s, cy+s), Point(cx, cy-s), Point(cx+s, cy+s) }; g->DrawLines(&p, pts, 3); }
+                    else if (btn.label == L"->") { g->DrawLine(&p, cx-s, cy+s, cx+s, cy-s); g->DrawLine(&p, cx+s, cy-s, cx+s-5, cy-s); g->DrawLine(&p, cx+s, cy-s, cx+s, cy-s+5); }
+                    else if (btn.label == L"O") { g->DrawEllipse(&p, cx-s, cy-s, s*2, s*2); }
+                    else if (btn.label == L"[]") { g->DrawRectangle(&p, cx-s, cy-s, s*2, s*2); }
+                    else { SolidBrush t(Color(255, 60, 80, 80)); RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, 32, 32); g->DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t); }
                 } else if (btn.type == ButtonType::ACTION) {
                     SolidBrush b(btn.isHovered ? Color(255, 210, 210, 220) : Color(255, 230, 230, 230)); Pen p(Color(150, 100, 100, 100), 1);
-                    DrawRoundedRect(g, btn.rect, 10, &b, &p); SolidBrush t(Color(255, 30, 30, 30));
-                    RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); g.DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t);
+                    DrawRoundedRect(*g, btn.rect, 10, &b, &p); SolidBrush t(Color(255, 30, 30, 30));
+                    RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); g->DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t);
                 } else {
-                    SolidBrush t(Color(255, 60, 80, 80)); RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); g.DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t);
+                    SolidBrush t(Color(255, 60, 80, 80)); RectF tr((REAL)btn.rect.X, (REAL)btn.rect.Y, (REAL)btn.rect.Width, (REAL)btn.rect.Height); g->DrawString(btn.label.c_str(), -1, &f, tr, &sf, &t);
                 }
             }
+            
+            Graphics screenGraphics(hdc);
+            screenGraphics.DrawImage(&bmp, 0, 0);
+            delete g;
             EndPaint(hWnd, &ps);
         } break;
         case WM_NCHITTEST: { 
@@ -339,11 +397,9 @@ LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             ScreenToClient(hWnd, &pt);
             for (const auto& btn : buttons) {
                 if (pt.x >= btn.rect.X && pt.x <= btn.rect.X + btn.rect.Width && 
-                    pt.y >= btn.rect.Y && pt.y <= btn.rect.Y + btn.rect.Height) {
-                    return HTCLIENT; // Area is a button, handle normally
-                }
+                    pt.y >= btn.rect.Y && pt.y <= btn.rect.Y + btn.rect.Height) return HTCLIENT;
             }
-            return HTCAPTION; // Rest of window is draggable
+            return HTCAPTION;
         }
         case WM_MOUSEMOVE: {
             int x = LOWORD(lParam), y = HIWORD(lParam); bool c = false;
@@ -357,13 +413,9 @@ LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         } break;
         case WM_KEYDOWN: {
             if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
-                if (!strokes.empty()) {
-                    strokes.pop_back();
-                    InvalidateRect(hWndOverlay, NULL, TRUE);
-                }
+                if (!strokes.empty()) { strokes.pop_back(); InvalidateRect(hWndOverlay, NULL, TRUE); }
             } else if (wParam == VK_DELETE) {
-                strokes.clear();
-                InvalidateRect(hWndOverlay, NULL, TRUE);
+                strokes.clear(); InvalidateRect(hWndOverlay, NULL, TRUE);
             }
         } break;
         case WM_CLOSE: PostQuitMessage(0); break;
