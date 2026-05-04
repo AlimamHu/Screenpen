@@ -93,6 +93,7 @@ void SetupUI();
 void DrawRoundedRect(Graphics& g, const Rect& rect, int radius, const Brush* brush, const Pen* pen);
 void DrawStroke(Graphics& g, const Stroke& stroke);
 void SetDrawingMode(bool active);
+void RefreshOverlay();
 
 // --- Entry Point ---
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
@@ -194,9 +195,6 @@ void SetDrawingMode(bool active) {
     }
     SetWindowLong(hWndOverlay, GWL_EXSTYLE, exStyle);
     
-    // Maintain Z-order: Toolbar on top of Overlay, both Topmost
-    // Note: Since hWndToolbar is owned by hWndOverlay, it will naturally stay on top,
-    // but we re-assert topmost status just in case.
     SetWindowPos(hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     SetWindowPos(hWndToolbar, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
@@ -206,6 +204,48 @@ void SetDrawingMode(bool active) {
     } else {
         SetForegroundWindow(hWndToolbar);
     }
+    RefreshOverlay();
+}
+
+void RefreshOverlay() {
+    if (!hWndOverlay) return;
+    RECT rc; GetWindowRect(hWndOverlay, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+
+    HDC hdcScreen = GetDC(NULL);
+    HDC hMemDC = CreateCompatibleDC(hdcScreen);
+    HBITMAP hBmp = CreateCompatibleBitmap(hdcScreen, w, h);
+    HBITMAP hOldBmp = (HBITMAP)SelectObject(hMemDC, hBmp);
+
+    {
+        Graphics g(hMemDC);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        g.SetCompositingQuality(CompositingQualityHighQuality);
+        
+        // Use a very low alpha (1) for the background so it's invisible but catches mouse events
+        g.Clear(Color(1, 0, 0, 0)); 
+        
+        for (const auto& s : strokes) DrawStroke(g, s);
+        if (isLButtonDown && currentTool != ToolType::SELECTOR) {
+            currentStroke.color = currentColor;
+            currentStroke.width = currentThickness;
+            currentStroke.tool = currentTool;
+            DrawStroke(g, currentStroke);
+        }
+    }
+
+    POINT ptSrc = { 0, 0 };
+    POINT ptDest = { rc.left, rc.top };
+    SIZE size = { w, h };
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+
+    UpdateLayeredWindow(hWndOverlay, hdcScreen, &ptDest, &size, hMemDC, &ptSrc, 0, &blend, ULW_ALPHA);
+
+    SelectObject(hMemDC, hOldBmp);
+    DeleteObject(hBmp);
+    DeleteDC(hMemDC);
+    ReleaseDC(NULL, hdcScreen);
 }
 
 void DrawStroke(Graphics& g, const Stroke& stroke) {
@@ -257,16 +297,8 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         }
         case WM_PAINT: {
             PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            Graphics g(hdc);
-            g.SetSmoothingMode(SmoothingModeAntiAlias);
-            for (const auto& s : strokes) DrawStroke(g, s);
-            if (isLButtonDown && currentTool != ToolType::SELECTOR) {
-                currentStroke.color = currentColor;
-                currentStroke.width = currentThickness;
-                currentStroke.tool = currentTool;
-                DrawStroke(g, currentStroke);
-            }
+            BeginPaint(hWnd, &ps);
+            RefreshOverlay();
             EndPaint(hWnd, &ps);
         } break;
         case WM_LBUTTONDOWN: {
@@ -303,7 +335,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                         else currentStroke.points[1] = pt;
                     }
                 }
-                InvalidateRect(hWnd, NULL, FALSE);
+                RefreshOverlay();
             } else if (currentTool == ToolType::SELECTOR) {
                 // Force cursor update
                 SendMessage(hWnd, WM_SETCURSOR, (WPARAM)hWnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
@@ -318,7 +350,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
                 }
                 selectedStrokeIndex = -1;
                 currentStroke.points.clear();
-                InvalidateRect(hWnd, NULL, TRUE);
+                RefreshOverlay();
             }
         } break;
         case WM_RBUTTONDOWN: SetDrawingMode(false); break;
@@ -326,9 +358,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         case WM_DESTROY: PostQuitMessage(0); break;
         case WM_KEYDOWN: {
             if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
-                if (!strokes.empty()) { strokes.pop_back(); InvalidateRect(hWnd, NULL, TRUE); }
+                if (!strokes.empty()) { strokes.pop_back(); RefreshOverlay(); }
             } else if (wParam == VK_DELETE) {
-                strokes.clear(); InvalidateRect(hWnd, NULL, TRUE);
+                strokes.clear(); RefreshOverlay();
             }
         } break;
         case WM_SYSKEYDOWN: {
@@ -411,11 +443,14 @@ LRESULT CALLBACK ToolbarWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             int x = LOWORD(lParam), y = HIWORD(lParam);
             for (auto& btn : buttons) { if (x >= btn.rect.X && x <= btn.rect.X + btn.rect.Width && y >= btn.rect.Y && y <= btn.rect.Y + btn.rect.Height) { btn.onClick(); InvalidateRect(hWnd, NULL, FALSE); break; } }
         } break;
+        case WM_MOVE: {
+            if (hWndOverlay) RefreshOverlay();
+        } break;
         case WM_KEYDOWN: {
             if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'Z')) {
-                if (!strokes.empty()) { strokes.pop_back(); InvalidateRect(hWndOverlay, NULL, TRUE); }
+                if (!strokes.empty()) { strokes.pop_back(); RefreshOverlay(); }
             } else if (wParam == VK_DELETE) {
-                strokes.clear(); InvalidateRect(hWndOverlay, NULL, TRUE);
+                strokes.clear(); RefreshOverlay();
             }
         } break;
         case WM_CLOSE: PostQuitMessage(0); break;
@@ -432,7 +467,7 @@ void CreateOverlay(HINSTANCE hInstance) {
     int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     int h = GetSystemMetrics(SM_CYVIRTUALSCREEN); 
     hWndOverlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT, L"ScreenPenOverlay", L"Overlay", WS_POPUP, x, y, w, h, NULL, NULL, hInstance, NULL); 
-    SetLayeredWindowAttributes(hWndOverlay, RGB(255, 0, 255), 255, LWA_COLORKEY); 
+    // No more SetLayeredWindowAttributes here, we use UpdateLayeredWindow
     ShowWindow(hWndOverlay, SW_SHOW);
 }
 void InitGDIPlus() { GdiplusStartupInput gsi; GdiplusStartup(&gdiplusToken, &gsi, NULL); }
